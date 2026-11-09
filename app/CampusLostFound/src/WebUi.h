@@ -305,7 +305,14 @@ function connectStream(){
   try{es=new EventSource("/api/stream");}catch(e){return;}
   S.es=es;
   es.onmessage=function(ev){onEvent(ev.data);};
-  es.onerror=function(){};
+  es.onerror=function(){
+    if(!S.user)return;
+    api("GET","/api/auth/me",undefined,{silent:true}).then(function(d){
+      if(d&&d.user){S.unread=num(d.unreadCount,0);updateTopbar();}
+    }).catch(function(e){
+      if(e&&e.status===401){logoutLocal();if(location.hash.indexOf("#/login")!==0)location.hash="#/login";}
+    });
+  };
 }
 function onEvent(raw){
   var d;
@@ -575,6 +582,7 @@ async function renderPublish(){
   h+='<label class="flabel">核验问题（可选）<input class="input" name="verifyQuestion" maxlength="120" placeholder="认领时需要回答的问题，例如：卡背面写了什么"></label>';
   h+='<label class="flabel">图片（最多 3 张，jpg / png / webp，单张不超过 5MB）<input class="input" type="file" name="images" id="imgInput" accept="image/jpeg,image/png,image/webp" multiple></label>';
   h+='<div class="previews" id="previews"><span class="muted">未选择图片</span></div>';
+  h+='<p class="hint">请勿上传含人脸、证件号码、家庭住址或定位信息的照片；建议只拍物品本身并遮挡敏感信息。</p>';
   h+='<button class="btn primary block" type="submit">发布</button></form></div></div>';
   render(h);
   bindPublish();
@@ -674,7 +682,7 @@ async function renderAdmin(){
   h+='<form class="vform" data-form="invite"><input class="input" name="maxUses" type="number" min="1" max="1000" value="50" placeholder="可用次数"><input class="input" name="validDays" type="number" min="1" max="365" value="30" placeholder="有效天数"><button class="btn primary" type="submit">生成邀请码</button></form>';
   var invs=iv.invites||[];
   if(!invs.length)h+='<p class="muted" style="margin-top:10px">暂无邀请码</p>';
-  else h+='<div class="invs" style="margin-top:10px">'+invs.map(function(v){return '<div class="inv"><code>'+esc(v.code)+'</code><span class="muted">'+num(v.uses,0)+' / '+num(v.maxUses,0)+' 次 · 到期 '+esc(v.expiresAtText||"—")+'</span>'+(v.disabled?'<span class="badge st5">已禁用</span>':"")+'</div>';}).join("")+'</div>';
+  else h+='<div class="invs" style="margin-top:10px">'+invs.map(function(v){return '<div class="inv"><code>'+esc(v.codeMasked||"已隐藏")+'</code><span class="muted">'+num(v.uses,0)+' / '+num(v.maxUses,0)+' 次 · 到期 '+esc(v.expiresAtText||"—")+'</span>'+(v.disabled?'<span class="badge st5">已禁用</span>':"")+'</div>';}).join("")+'</div><p class="hint">完整邀请码仅在创建时显示一次，列表只显示掩码；请创建后立即复制保存。</p>';
   h+='</section>';
   h+='<section class="panel"><div class="sechead"><h3>物品搜索 / 下架</h3></div>';
   h+='<form class="vform" data-form="admin-search"><input class="input" name="q" placeholder="输入标题关键词（留空列出最近物品）" value="'+esc(ADMINQ)+'"><button class="btn" type="submit">搜索</button></form><div id="adminItems"></div></section>';
@@ -725,9 +733,9 @@ function renderLogin(){
   if(isLogin){
     form='<form data-form="login"><label class="flabel">学号<input class="input" name="studentNo" autocomplete="username" placeholder="请输入学号" required></label><label class="flabel">密码<input class="input" type="password" name="password" autocomplete="current-password" placeholder="请输入密码" required></label><div class="fbtns"><button class="btn primary block" type="submit">登录</button></div></form>';
   }else{
-    form='<form data-form="register"><label class="flabel">邀请码<input class="input" name="inviteCode" placeholder="请输入邀请码，例如 CAMPUS-2026" required></label><label class="flabel">学号<input class="input" name="studentNo" placeholder="4~20 位字母或数字" required></label><label class="flabel">姓名<input class="input" name="name" maxlength="20" placeholder="真实姓名" required></label><label class="flabel">学院<input class="input" name="college" maxlength="30" placeholder="例如：计算机学院" required></label><label class="flabel">密码<input class="input" type="password" name="password" autocomplete="new-password" placeholder="至少 6 位" required></label><div class="fbtns"><button class="btn primary block" type="submit">注册并登录</button></div></form>';
+    form='<form data-form="register"><label class="flabel">邀请码<input class="input" name="inviteCode" autocomplete="off" spellcheck="false" placeholder="请输入管理员发放的邀请码" required></label><label class="flabel">学号<input class="input" name="studentNo" placeholder="4~20 位字母或数字" required></label><label class="flabel">姓名<input class="input" name="name" maxlength="20" placeholder="真实姓名" required></label><label class="flabel">学院<input class="input" name="college" maxlength="30" placeholder="例如：计算机学院" required></label><label class="flabel">密码<input class="input" type="password" name="password" autocomplete="new-password" placeholder="至少 6 位" required></label><div class="fbtns"><button class="btn primary block" type="submit">注册并登录</button></div></form>';
   }
-  render('<div class="authwrap"><div class="authcard"><div class="authhead"><div class="alogo">🧭</div><h1>校园失物招领</h1><p class="muted">寻找失物 · 传递善意</p></div><div class="tabs center"><button type="button" class="tab'+(isLogin?" on":"")+'" data-act="login-tab" data-tab="login">登录</button><button type="button" class="tab'+(isLogin?"":" on")+'" data-act="login-tab" data-tab="register">注册</button></div>'+form+'<p class="hint">'+(isLogin?"演示管理员：admin / admin123":"注册需要有效邀请码：CAMPUS-2026")+'</p></div></div>');
+  render('<div class="authwrap"><div class="authcard"><div class="authhead"><div class="alogo">🧭</div><h1>校园失物招领</h1><p class="muted">寻找失物 · 传递善意</p></div><div class="tabs center"><button type="button" class="tab'+(isLogin?" on":"")+'" data-act="login-tab" data-tab="login">登录</button><button type="button" class="tab'+(isLogin?"":" on")+'" data-act="login-tab" data-tab="register">注册</button></div>'+form+'<p class="hint">'+(isLogin?"管理员初始密码见服务端控制台（仅首次启动显示一次）":"邀请码由管理员发放，请向管理员获取；请勿公开传播")+'</p></div></div>');
 }
 
 /* ---------------- 业务操作 ---------------- */
@@ -748,7 +756,6 @@ async function doRegister(f){
   if(!inviteCode||!studentNo||!name||!college||!password)throw mkErr("请填写完整的注册信息",400);
   if(password.length<6)throw mkErr("密码至少 6 位",400);
   await api("POST","/api/auth/register",{inviteCode:inviteCode,studentNo:studentNo,name:name,college:college,password:password});
-  await api("POST","/api/auth/login",{studentNo:studentNo,password:password});
   var me=await api("GET","/api/auth/me",undefined,{silent:true});
   setUser(me.user);
   S.unread=num(me.unreadCount,0);
@@ -828,7 +835,8 @@ async function doInvite(f){
   var maxUses=Math.min(1000,Math.max(1,num(valOf(f,"maxUses"),50)));
   var validDays=Math.min(365,Math.max(1,num(valOf(f,"validDays"),30)));
   var d=await api("POST","/api/admin/invites",{maxUses:maxUses,validDays:validDays});
-  toast("邀请码已生成："+d.invite.code,"ok");
+  var full=(d.invite&&d.invite.code)||"";
+  openModal('<h3>邀请码已生成（仅显示一次）</h3><p class="muted">请立即复制保存；关闭后无法再次查看完整码，列表只显示掩码。</p><div style="font-size:22px;letter-spacing:1px;margin:14px 0;padding:12px;background:#f1faf7;border-radius:8px;text-align:center;word-break:break-all"><code>'+esc(full)+'</code></div><div class="fbtns"><button type="button" class="btn primary" data-act="modal-close">我已保存</button></div>');
   await renderAdmin();
 }
 async function doReport(f){

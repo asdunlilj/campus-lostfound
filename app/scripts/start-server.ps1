@@ -5,6 +5,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $exe = @(
+    (Join-Path $root 'bin\Debug\CampusLostFound.exe'),
+    (Join-Path $root 'bin\Release\CampusLostFound.exe'),
     (Join-Path $root 'x64\Debug\CampusLostFound.exe'),
     (Join-Path $root 'x64\Release\CampusLostFound.exe')
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1

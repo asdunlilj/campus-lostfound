@@ -67,7 +67,7 @@ Remove-NetFirewallRule -DisplayName "lan-test-8000"   # ⑤ 清理
 ## 2. HTTPS 方案对比（本方案必答题）
 ### 2.1 为什么必须 HTTPS
 - **secure context 硬门槛**：Service Worker/PWA 安装、通知、`getUserMedia` 摄像头流、剪贴板、定位，在非 localhost 的 HTTP 下全部不可用；`https://` 页面里的 `ws://` 属混合内容会被拦 → **实时交互必须 wss://**。
-- 内网 IP 属 RFC1918 私有地址，**任何公共 CA 都不会为 10.40.x.x 签证书** → 要么自建信任链，要么"域名解析到内网 IP"。
+- 内网 IP 属 RFC1918 私有地址，**任何公共 CA 都不会为内网地址签证书** → 要么自建信任链，要么"域名解析到内网 IP"。
 ### 2.2 方案对比
 
 | 方案 | 手机受信？ | 前置条件 | 工作量 | 主要风险 | 结论 |

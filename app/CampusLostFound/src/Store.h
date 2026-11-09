@@ -107,7 +107,8 @@ struct AuditLog {
 };
 
 struct Invite {
-    std::string code;
+    std::string codeHash;    // SHA-256(规范化后的邀请码)，数据库中不保存明文
+    std::string codeMasked;  // 列表展示用掩码，例如 LF-3F9A****
     int maxUses = 0;
     int uses = 0;
     int64_t expiresAt = 0;
@@ -135,8 +136,11 @@ public:
     Store(const Store&) = delete;
     Store& operator=(const Store&) = delete;
 
-    // dataDir 不存在则创建；无 db.json 时写入种子数据（管理员 + 邀请码）
+    // dataDir 不存在则创建；无 db.json 时写入种子数据（管理员）。
+    // 首次启动会生成随机管理员密码，只能通过 TakeInitialAdminPassword 取出一次用于控制台展示。
     bool Load(const std::string& dataDir, std::string& error);
+    // 首次初始化时生成的随机管理员密码（仅能取出一次；非首次启动返回空串）
+    std::string TakeInitialAdminPassword();
     bool Save(std::string* errorOut = nullptr);
     const std::string& DataDir() const;
     void SetEventSink(std::function<void(const std::string& eventJson, int64_t targetUserId)> sink);
@@ -155,8 +159,10 @@ public:
 
     // ---- 邀请码 ----
     std::vector<Invite> AllInvites() const;
+    // 按用户输入的明文邀请码查询（内部先规范化再哈希比对）
     std::optional<Invite> FindInvite(const std::string& code) const;
-    Invite CreateInvite(int maxUses, int validDays, const std::string& createdBy);
+    // 创建邀请码：fullCode 输出完整明文，仅用于本次创建响应/控制台，绝不落库
+    Invite CreateInvite(int maxUses, int validDays, const std::string& createdBy, std::string& fullCode);
     bool ConsumeInvite(const std::string& code, std::string& error);
 
     // ---- 物品 ----
@@ -170,7 +176,8 @@ public:
     bool UpdateItem(int64_t itemId, const std::string& title, const std::string& description,
                     int categoryId, int locationId, const std::string& eventTime,
                     const std::string& verifyQuestion, std::string& error);
-    bool SetItemStatus(int64_t itemId, int status, const std::string& reason, std::string& error);
+    // actorId 用于区分布者自己删除与管理员下架：自己删除不再给自己发“被下架”通知
+    bool SetItemStatus(int64_t itemId, int status, const std::string& reason, int64_t actorId, std::string& error);
     void IncrementView(int64_t itemId);
     bool AddItemImage(int64_t itemId, const std::string& fileName, std::string& imageId, std::string& error);
     bool RemoveItemImage(int64_t itemId, const std::string& imageId, std::string& error);
@@ -222,6 +229,7 @@ private:
 
     mutable std::recursive_mutex mutex_;
     std::string dataDir_;
+    std::string initialAdminPassword_;
     std::function<void(const std::string&, int64_t)> eventSink_;
 
     std::vector<Category> categories_;

@@ -1,10 +1,12 @@
 param(
-    [string]$BaseUrl = 'http://127.0.0.1:8080'
+    [string]$BaseUrl = 'http://127.0.0.1:8080',
+    [string]$AdminPassword = ''
 )
 $ErrorActionPreference = 'Stop'
 $base = $BaseUrl.TrimEnd('/')
+if (-not $AdminPassword) { throw '请通过 -AdminPassword 传入首次启动控制台打印的随机管理员密码' }
 $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-$loginBody = '{"studentNo":"admin","password":"admin123"}'
+$loginBody = (@{ studentNo = 'admin'; password = $AdminPassword } | ConvertTo-Json -Compress)
 $login = Invoke-RestMethod -Method Post -Uri "$base/api/auth/login" -WebSession $session -Headers @{ 'X-Requested-With' = 'CampusLF' } -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($loginBody))
 if (-not $login.ok) { throw '管理员登录失败（服务是否已启动？端口是否正确？）' }
 Write-Host '管理员登录成功，开始创建演示数据...'

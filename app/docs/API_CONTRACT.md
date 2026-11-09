@@ -72,10 +72,12 @@ HTTP 状态码与错误对应：400/401/403/404/409/429/500。
 
 ### 1.6 InviteView
 ~~~json
-{ "code": "CAMPUS-2026", "maxUses": 500, "uses": 3, "expiresAt": "2027-11-08T00:00:00Z",
+{ "codeMasked": "LF-3F9A****", "maxUses": 500, "uses": 3, "expiresAt": "2027-11-08T00:00:00Z",
   "expiresAtText": "2027-11-08 08:00", "disabled": false,
   "createdBy": "admin", "createdAt": "..." }
 ~~~
+注意：列表/查询接口**只返回掩码**；完整邀请码仅在「创建邀请码」响应里返回一次（字段 code），
+服务器数据库只保存 SHA-256 哈希，无法再次取回明文。
 
 ### 1.7 AuditView
 ~~~json
@@ -178,7 +180,8 @@ GET /api/admin/reports —— { "reports": [ReportView] }
 POST /api/admin/reports/{id}/handle —— body {action:"resolve"|"dismiss"}；返回 { "report": ReportView }
 
 GET /api/admin/invites —— { "invites": [InviteView] }
-POST /api/admin/invites —— body {maxUses, validDays}；返回 { "invite": InviteView }
+POST /api/admin/invites —— body {maxUses, validDays}；返回 { "invite": InviteView+code }
+- **完整邀请码 code 只在本次响应返回一次**，请立即保存；后续列表只有 codeMasked。
 
 GET /api/admin/audit?limit=100 —— { "logs": [AuditView] }
 
@@ -201,11 +204,15 @@ data: {"type":"...","...":...}
 - claim-updated：{ type, claimId, itemPublicId, status } —— 发给认领人与发布者
 - notification：{ type, notification: NotificationView, unreadCount } —— 仅接收人
 
-## 10. 演示账号与邀请码（首次启动自动创建）
+> 安全语义：注销、修改密码、会话空闲过期后，服务端会主动关闭对应 SSE 连接；
+> 客户端收到中断后应重新请求 /api/auth/me，401 则回到登录页。
 
-- 管理员：学号 admin / 密码 admin123（请在“我的”页修改密码）
-- 邀请码：CAMPUS-2026（maxUses 500，365 天有效）
-- 普通用户可通过邀请码自行注册。
+## 10. 首次启动与凭据（安全设计）
+
+- 管理员：学号 **admin**；密码在**首次启动时随机生成并只在控制台打印一次**，不落库、不写源码、不进日志；登录后请立即修改。
+- 邀请码：**不预置**。管理员登录后在「管理后台 → 邀请码」创建，完整码只在创建响应里返回一次；之后列表只有掩码，数据库只存 SHA-256 哈希。
+- 普通用户通过管理员发放的邀请码注册；注册页/登录页不展示任何明文邀请码。
+- 忘记管理员密码：删除 data 目录重启（数据清空，会生成新的随机密码）。
 
 ## 11. 状态文本
 

@@ -308,7 +308,8 @@ JsonValue MakeReportView(const Report& report, Store& store) {
 
 JsonValue MakeInviteView(const Invite& invite) {
     JsonValue v = JsonValue::MakeObject();
-    v.Set("code", JsonValue(invite.code));
+    // 列表/查询只返回掩码；完整邀请码仅在创建响应中返回一次
+    v.Set("codeMasked", JsonValue(invite.codeMasked));
     v.Set("maxUses", JsonValue(invite.maxUses));
     v.Set("uses", JsonValue(invite.uses));
     v.Set("expiresAt", JsonValue(FormatIso8601(invite.expiresAt)));
@@ -337,6 +338,7 @@ JsonValue MakeAuditView(const AuditLog& log, Store& store) {
 struct SseClient {
     intptr_t socket = 0;
     int64_t userId = 0;
+    std::string sessionToken;  // 用于周期性校验会话是否已注销/过期
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::string> queue;
@@ -345,6 +347,39 @@ struct SseClient {
 
 std::mutex gSseMutex;
 std::vector<std::shared_ptr<SseClient>> gSseClients;
+
+// 关闭某个用户的全部 SSE 长连接（注销、改密、会话过期时调用），防止已注销会话继续收到私有事件。
+void CloseSseForUser(int64_t userId) {
+    std::vector<std::shared_ptr<SseClient>> targets;
+    {
+        std::lock_guard<std::mutex> lock(gSseMutex);
+        for (const auto& client : gSseClients) {
+            if (userId == 0 || client->userId == userId) targets.push_back(client);
+        }
+    }
+    for (const auto& client : targets) {
+        std::lock_guard<std::mutex> lock(client->mutex);
+        client->closed = true;
+        client->cv.notify_all();
+    }
+}
+
+// 只关闭指定会话令牌对应的 SSE（单标签页退出登录，不影响同账号其他标签页）
+void CloseSseForToken(const std::string& token) {
+    if (token.empty()) return;
+    std::vector<std::shared_ptr<SseClient>> targets;
+    {
+        std::lock_guard<std::mutex> lock(gSseMutex);
+        for (const auto& client : gSseClients) {
+            if (client->sessionToken == token) targets.push_back(client);
+        }
+    }
+    for (const auto& client : targets) {
+        std::lock_guard<std::mutex> lock(client->mutex);
+        client->closed = true;
+        client->cv.notify_all();
+    }
+}
 
 void PushEvent(const std::string& eventJson, int64_t targetUserId) {
     std::string frame = "event: message\ndata: " + eventJson + "\n\n";
@@ -375,6 +410,7 @@ void SendRawHttp(intptr_t socketHandle, int status, const std::string& body) {
 
 void HandleStream(const HttpRequest& req, intptr_t socketHandle) {
     auto current = CurrentUser(req);
+    const std::string sessionToken = req.CookieValue(kSessionCookie);
     if (!current) {
         std::string body =
             "{\"ok\":false,\"error\":{\"code\":\"UNAUTHORIZED\",\"message\":\"请先登录\"}}";
@@ -393,6 +429,7 @@ void HandleStream(const HttpRequest& req, intptr_t socketHandle) {
     auto client = std::make_shared<SseClient>();
     client->socket = socketHandle;
     client->userId = current->id;
+    client->sessionToken = sessionToken;
     {
         std::lock_guard<std::mutex> lock(gSseMutex);
         gSseClients.push_back(client);
@@ -405,8 +442,12 @@ void HandleStream(const HttpRequest& req, intptr_t socketHandle) {
             client->cv.wait_for(lock, std::chrono::seconds(20), [&client]() {
                 return !client->queue.empty() || client->closed;
             });
+            if (client->closed) break;
             frames.swap(client->queue);
         }
+        // 每 20 秒校验一次会话：注销/改密/空闲过期后服务端主动断开，避免继续接收私有事件
+        auto sessionUser = Auth::Instance().ValidateSession(client->sessionToken, false);
+        if (!sessionUser || *sessionUser != client->userId) break;
         if (frames.empty()) {
             if (!SocketSendAll(socketHandle, ": ping\n\n")) break;
         } else {
@@ -563,10 +604,13 @@ HttpResponse HandleRegister(const HttpRequest& req) {
     std::string passwordHash = Auth::Instance().HashPassword(password);
     if (passwordHash.empty()) return MakeError("INTERNAL", "密码处理失败", 500);
     std::string storeError;
-    int64_t userId = Store::Instance().CreateUser(studentNo, name, college, passwordHash, "student", storeError);
-    if (userId <= 0) return MakeError("INTERNAL", storeError.empty() ? "注册失败" : storeError, 500);
+    // 先核销邀请码再建号：避免并发下“账号已建但邀请码未核销”的孤儿账号
     if (!Store::Instance().ConsumeInvite(inviteCode, storeError)) {
-        return MakeError("INTERNAL", "邀请码核销失败", 500);
+        return MakeError("INVALID_PARAM", storeError.empty() ? "邀请码无效或已用完" : storeError, 400);
+    }
+    int64_t userId = Store::Instance().CreateUser(studentNo, name, college, passwordHash, "student", storeError);
+    if (userId <= 0) {
+        return MakeError("INTERNAL", storeError.empty() ? "注册失败，请联系管理员补发邀请码" : storeError, 500);
     }
     Store::Instance().AddAudit(userId, "auth.register", "新用户注册：" + studentNo, req.remoteIp);
 
@@ -613,7 +657,10 @@ HttpResponse HandleLogout(const HttpRequest& req) {
     if (!token.empty()) {
         auto userId = Auth::Instance().ValidateSession(token, false);
         Auth::Instance().RevokeSession(token);
-        if (userId) Store::Instance().AddAudit(*userId, "auth.logout", "退出登录", req.remoteIp);
+        if (userId) {
+            CloseSseForToken(token);
+            Store::Instance().AddAudit(*userId, "auth.logout", "退出登录", req.remoteIp);
+        }
     }
     HttpResponse response = MakeOk(EmptyObject());
     response.ClearCookie(kSessionCookie);
@@ -652,6 +699,7 @@ HttpResponse HandleChangePassword(const HttpRequest& req) {
         return MakeError("INTERNAL", "修改密码失败", 500);
     }
     Auth::Instance().RevokeAllForUser(user.id);
+    CloseSseForUser(user.id);
     std::string token = Auth::Instance().CreateSession(user.id);
     Store::Instance().AddAudit(user.id, "auth.change_password", "修改密码", req.remoteIp);
     HttpResponse response = MakeOk(EmptyObject());
@@ -728,6 +776,7 @@ HttpResponse HandleItemList(const HttpRequest& req) {
     ParseInt(req.QueryValue("page", "1"), page);
     ParseInt(req.QueryValue("pageSize", "12"), pageSize);
     if (page < 1) page = 1;
+    if (page > 100000) page = 100000;  // 防止 (page-1)*pageSize 溢出
     if (pageSize < 1) pageSize = 1;
     if (pageSize > 50) pageSize = 50;
 
@@ -854,7 +903,7 @@ HttpResponse HandleItemDelete(const HttpRequest& req) {
     if (!item) return MakeError("NOT_FOUND", "物品不存在", 404);
     if (item->userId != user.id && user.role != "admin") return MakeError("FORBIDDEN", "无权删除该物品", 403);
     std::string storeError;
-    if (!store.SetItemStatus(item->id, 5, user.role == "admin" ? "管理员删除" : "发布者删除", storeError)) {
+    if (!store.SetItemStatus(item->id, 5, user.role == "admin" ? "管理员删除" : "发布者删除", user.id, storeError)) {
         return MakeError("CONFLICT", storeError.empty() ? "删除失败" : storeError, 409);
     }
     if (user.role == "admin") {
@@ -1007,6 +1056,7 @@ HttpResponse HandleMyItems(const HttpRequest& req) {
     ParseInt(req.QueryValue("page", "1"), page);
     ParseInt(req.QueryValue("pageSize", "50"), pageSize);
     if (page < 1) page = 1;
+    if (page > 100000) page = 100000;  // 防止 (page-1)*pageSize 溢出
     if (pageSize < 1) pageSize = 1;
     if (pageSize > 100) pageSize = 100;
     int total = 0;
@@ -1239,10 +1289,13 @@ HttpResponse HandleAdminInviteCreate(const HttpRequest& req) {
     int validDays = static_cast<int>(IntField(body, "validDays", 30));
     if (maxUses < 1 || maxUses > 10000) return MakeError("INVALID_PARAM", "可用次数 1~10000", 400);
     if (validDays < 1 || validDays > 3650) return MakeError("INVALID_PARAM", "有效期 1~3650 天", 400);
-    Invite invite = Store::Instance().CreateInvite(maxUses, validDays, user.studentNo);
-    Store::Instance().AddAudit(user.id, "invite.create", "创建邀请码：" + invite.code, req.remoteIp);
+    std::string fullCode;
+    Invite invite = Store::Instance().CreateInvite(maxUses, validDays, user.studentNo, fullCode);
+    Store::Instance().AddAudit(user.id, "invite.create", "创建邀请码：" + invite.codeMasked, req.remoteIp);
+    JsonValue inviteView = MakeInviteView(invite);
+    inviteView.Set("code", JsonValue(fullCode));  // 仅本次创建响应返回完整码，前端提示立即保存
     JsonValue data = JsonValue::MakeObject();
-    data.Set("invite", MakeInviteView(invite));
+    data.Set("invite", std::move(inviteView));
     return MakeOk(std::move(data));
 }
 
@@ -1275,7 +1328,7 @@ HttpResponse HandleAdminTakeDown(const HttpRequest& req) {
     std::string reason = Trim(StringField(body, "reason"));
     if (reason.empty()) reason = "管理员下架";
     std::string storeError;
-    if (!store.SetItemStatus(item->id, 5, reason, storeError)) {
+    if (!store.SetItemStatus(item->id, 5, reason, user.id, storeError)) {
         return MakeError("CONFLICT", storeError.empty() ? "下架失败" : storeError, 409);
     }
     store.AddAudit(user.id, "item.take_down", "下架物品：" + item->title + "（" + reason + "）", req.remoteIp);

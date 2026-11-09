@@ -80,7 +80,7 @@ std::vector<std::string> LocalIPv4Addresses() {
     return result;
 }
 
-void PrintBanner(int port, const std::string& dataDir) {
+void PrintBanner(int port, const std::string& dataDir, const std::string& initialAdminPassword) {
     std::printf("\n");
     std::printf("==============================================================\n");
     std::printf("  Campus Lost & Found  |  校园失物招领系统  v1.0\n");
@@ -94,10 +94,17 @@ void PrintBanner(int port, const std::string& dataDir) {
         std::printf("  局域网访问: 未检测到 IPv4 地址，请检查网络连接\n");
     }
     std::printf("  数据目录:   %s\n", dataDir.c_str());
-    std::printf("  管理员账号: admin / admin123   (请登录后立即修改密码)\n");
-    std::printf("  邀请码:     CAMPUS-2026\n");
+    if (!initialAdminPassword.empty()) {
+        std::printf("  首次启动管理员: admin / %s\n", initialAdminPassword.c_str());
+        std::printf("  ※ 该初始密码仅在本次启动显示，请立即登录并在“我的”中修改；\n");
+        std::printf("    关闭窗口后无法找回（可删除 data 目录重新初始化，或联系管理员重置）。\n");
+    } else {
+        std::printf("  管理员账号: admin（密码为首次启动时设置/修改后的密码）\n");
+    }
+    std::printf("  邀请码:     登录管理员后台创建；完整邀请码仅在创建时显示一次\n");
     std::printf("  按 Ctrl+C 停止服务\n");
     std::printf("==============================================================\n\n");
+    std::fflush(stdout);
 }
 
 int ParseArguments(int argc, char** argv, int& port, std::string& bindAddress, std::string& dataDir,
@@ -152,6 +159,8 @@ int main(int argc, char** argv) {
         std::printf("[错误] 数据加载失败: %s\n", error.c_str());
         return 1;
     }
+    // 首次初始化时取出随机管理员密码（仅内存中保留一次，用于控制台提示）
+    const std::string initialAdminPassword = Store::Instance().TakeInitialAdminPassword();
 
     HttpServer server;
     Api::RegisterRoutes(server);
@@ -161,7 +170,7 @@ int main(int argc, char** argv) {
     }
     Api::StartBackgroundTasks();
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
-    PrintBanner(port, Store::Instance().DataDir());
+    PrintBanner(port, Store::Instance().DataDir(), initialAdminPassword);
 
     while (!gStopRequested.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));

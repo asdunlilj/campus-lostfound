@@ -254,7 +254,8 @@ JsonValue AuditToJson(const AuditLog& audit) {
 
 JsonValue InviteToJson(const Invite& invite) {
     JsonValue value = MakeObj();
-    value.Set("code", invite.code);
+    value.Set("codeHash", invite.codeHash);
+    value.Set("codeMasked", invite.codeMasked);
     value.Set("maxUses", invite.maxUses);
     value.Set("uses", invite.uses);
     value.Set("expiresAt", invite.expiresAt);
@@ -397,7 +398,18 @@ AuditLog AuditFromJson(const JsonValue& value) {
 
 Invite InviteFromJson(const JsonValue& value) {
     Invite invite;
-    invite.code = StrField(value, "code");
+    invite.codeHash = StrField(value, "codeHash");
+    invite.codeMasked = StrField(value, "codeMasked");
+    // 兼容旧版本：旧数据里的明文 code 迁移为哈希 + 掩码（下次保存后明文消失）
+    if (invite.codeHash.empty()) {
+        const std::string legacyCode = StrField(value, "code");
+        if (!legacyCode.empty()) {
+            invite.codeHash = Sha256Hex(ToUpperAscii(Trim(legacyCode)));
+            invite.codeMasked = legacyCode.substr(0, 7) + "****";
+            // 旧版本明文邀请码可能已经泄露（例如曾被打印/公开），升级后一律停用，需管理员重新创建
+            invite.disabled = true;
+        }
+    }
     invite.maxUses = IntFieldInt(value, "maxUses", 0);
     invite.uses = IntFieldInt(value, "uses", 0);
     invite.expiresAt = IntField(value, "expiresAt", 0);
@@ -448,28 +460,30 @@ void LoadArrayField(const JsonValue& root, const char* key, std::vector<T>& out,
     }
 }
 
+std::string NormalizeInviteCode(const std::string& code) {
+    return ToUpperAscii(Trim(code));
+}
+
+std::string HashInviteCode(const std::string& code) {
+    const std::string normalized = NormalizeInviteCode(code);
+    if (normalized.empty()) return std::string();
+    return Sha256Hex(normalized);
+}
+
 Invite* FindInviteByCode(std::vector<Invite>& invites, const std::string& code) {
-    const std::string trimmed = Trim(code);
+    const std::string hash = HashInviteCode(code);
+    if (hash.empty()) return nullptr;
     for (Invite& invite : invites) {
-        if (invite.code == trimmed) return &invite;
-    }
-    const std::string upper = ToUpperAscii(trimmed);
-    if (upper.empty()) return nullptr;
-    for (Invite& invite : invites) {
-        if (ToUpperAscii(invite.code) == upper) return &invite;
+        if (!invite.codeHash.empty() && ConstantTimeEquals(invite.codeHash, hash)) return &invite;
     }
     return nullptr;
 }
 
 const Invite* FindInviteByCode(const std::vector<Invite>& invites, const std::string& code) {
-    const std::string trimmed = Trim(code);
+    const std::string hash = HashInviteCode(code);
+    if (hash.empty()) return nullptr;
     for (const Invite& invite : invites) {
-        if (invite.code == trimmed) return &invite;
-    }
-    const std::string upper = ToUpperAscii(trimmed);
-    if (upper.empty()) return nullptr;
-    for (const Invite& invite : invites) {
-        if (ToUpperAscii(invite.code) == upper) return &invite;
+        if (!invite.codeHash.empty() && ConstantTimeEquals(invite.codeHash, hash)) return &invite;
     }
     return nullptr;
 }
@@ -711,7 +725,14 @@ std::optional<Invite> Store::FindInvite(const std::string& code) const {
     return *invite;
 }
 
-Invite Store::CreateInvite(int maxUses, int validDays, const std::string& createdBy) {
+std::string Store::TakeInitialAdminPassword() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::string password = initialAdminPassword_;
+    initialAdminPassword_.clear();
+    return password;
+}
+
+Invite Store::CreateInvite(int maxUses, int validDays, const std::string& createdBy, std::string& fullCode) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     Invite invite;
     int useLimit = maxUses;
@@ -722,10 +743,12 @@ Invite Store::CreateInvite(int maxUses, int validDays, const std::string& create
     if (days > 3650) days = 3650;
     std::string code;
     do {
-        code = "LF-" + ToUpperAscii(RandomHex(5));
+        code = "LF-" + ToUpperAscii(RandomHex(8)).substr(0, 12);
     } while (FindInviteByCode(invites_, code) != nullptr);
     const int64_t now = NowEpoch();
-    invite.code = code;
+    fullCode = code;
+    invite.codeHash = HashInviteCode(code);
+    invite.codeMasked = code.substr(0, 7) + "****";
     invite.maxUses = useLimit;
     invite.uses = 0;
     invite.expiresAt = now + static_cast<int64_t>(days) * kDaySeconds;
@@ -880,7 +903,7 @@ bool Store::UpdateItem(int64_t itemId, const std::string& title, const std::stri
     return true;
 }
 
-bool Store::SetItemStatus(int64_t itemId, int status, const std::string& reason, std::string& error) {
+bool Store::SetItemStatus(int64_t itemId, int status, const std::string& reason, int64_t actorId, std::string& error) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     error.clear();
     if (status < kItemOpen || status > kItemRemoved) {
@@ -895,25 +918,45 @@ bool Store::SetItemStatus(int64_t itemId, int status, const std::string& reason,
     if (item->status == status && (status != kItemRemoved || item->removedReason == reason)) {
         return true;
     }
+    const int64_t now = NowEpoch();
     item->status = status;
-    item->updatedAt = NowEpoch();
+    item->updatedAt = now;
     if (status == kItemRemoved) {
         item->removedReason = reason;
     } else if (status == kItemOpen) {
         item->removedReason.clear();
     }
-    Notification notification;
-    bool notifyOwner = (status == kItemRemoved);
-    if (notifyOwner) {
-        std::string body = "「" + item->title + "」已被管理员下架";
-        if (!reason.empty()) body += "，原因：" + reason;
-        body += "。";
-        notification = PushNotification(notifications_, seqNotification_, item->userId, "item", "物品已被下架",
-                                        body, "#/item/" + item->publicId);
+
+    std::vector<Notification> pendingNotifications;
+    std::vector<std::pair<std::string, int64_t>> pendingEvents;
+    if (status == kItemRemoved) {
+        // 下架/删除后，所有进行中的认领申请自动关闭，避免“物品已下架但认领仍可审核/核销”的悬空状态
+        for (Claim& claim : claims_) {
+            if (claim.itemId != item->id) continue;
+            if (claim.status != kClaimPending && claim.status != kClaimApproved) continue;
+            claim.status = kClaimExpired;
+            claim.reviewedAt = now;
+            const std::string claimEvent = EventClaimUpdatedJson(claim, *item);
+            pendingEvents.push_back(std::make_pair(claimEvent, claim.claimantId));
+            pendingEvents.push_back(std::make_pair(claimEvent, item->userId));
+            pendingNotifications.push_back(PushNotification(
+                notifications_, seqNotification_, claim.claimantId, "claim", "认领申请已关闭",
+                "「" + item->title + "」已被下架，你的认领申请已关闭。", "#/item/" + item->publicId));
+        }
+        // 仅当操作者不是发布者本人时，才给发布者发“被下架”通知（自己删除不再误发管理员下架通知）
+        if (actorId != item->userId) {
+            std::string body = "「" + item->title + "」已被下架";
+            if (!reason.empty()) body += "，原因：" + reason;
+            body += "。";
+            pendingNotifications.push_back(PushNotification(
+                notifications_, seqNotification_, item->userId, "item", "物品已被下架", body,
+                "#/item/" + item->publicId));
+        }
     }
     SaveLocked(nullptr);
     EmitLocked(EventItemUpdatedJson(*item), 0);
-    if (notifyOwner) EmitNotificationLocked(notification);
+    for (const auto& event : pendingEvents) EmitLocked(event.first, event.second);
+    for (const Notification& notification : pendingNotifications) EmitNotificationLocked(notification);
     return true;
 }
 
@@ -1049,6 +1092,10 @@ bool Store::CreateClaim(Claim& claim, std::string& error) {
         error = "该物品当前不可认领";
         return false;
     }
+    if (item->expiresAt > 0 && item->expiresAt <= NowEpoch()) {
+        error = "物品已过期，无法认领";
+        return false;
+    }
     if (claim.claimantId <= 0) {
         error = "请先登录后再认领";
         return false;
@@ -1116,7 +1163,19 @@ bool Store::ApproveClaim(int64_t claimId, int64_t actorId, Claim& out, std::stri
         error = "无权审核该认领申请";
         return false;
     }
+    if (item->status != kItemClaimPending) {
+        error = "物品当前状态不可审核认领";
+        return false;
+    }
     const int64_t now = NowEpoch();
+    if (item->expiresAt > 0 && item->expiresAt <= now) {
+        error = "物品已过期，无法通过认领";
+        return false;
+    }
+    if (claim->createdAt > 0 && now - claim->createdAt >= kClaimTimeoutSeconds) {
+        error = "认领申请已超时，请让申请人重新提交";
+        return false;
+    }
     claim->status = kClaimApproved;
     claim->reviewedAt = now;
     claim->pickupCode = GeneratePickupCode();
@@ -1265,6 +1324,10 @@ bool Store::VerifyClaim(int64_t claimId, int64_t actorId, const std::string& cod
     Item* item = FindById(items_, claim->itemId);
     if (item == nullptr) {
         error = "关联的物品不存在";
+        return false;
+    }
+    if (item->status != kItemClaimApproved) {
+        error = "物品当前状态不可核销";
         return false;
     }
     const User* actor = FindById(users_, actorId);
@@ -1477,7 +1540,7 @@ void Store::ExpireOverdue() {
     std::vector<std::pair<std::string, int64_t>> claimEvents;
     std::vector<Notification> pendingNotifications;
 
-    // 1) 物品过期：status 0/1 且 expiresAt < now -> 4，并通知发布者
+    // 1) 物品过期：status 0/1 且 expiresAt < now -> 4，并通知发布者；其进行中的认领申请一并关闭
     for (Item& item : items_) {
         if (item.status != kItemOpen && item.status != kItemClaimPending) continue;
         if (item.expiresAt <= 0 || item.expiresAt > now) continue;
@@ -1488,6 +1551,18 @@ void Store::ExpireOverdue() {
         pendingNotifications.push_back(PushNotification(
             notifications_, seqNotification_, item.userId, "item", "物品已过期",
             "「" + item.title + "」已超过有效期，已自动标记为过期。", "#/item/" + item.publicId));
+        for (Claim& claim : claims_) {
+            if (claim.itemId != item.id) continue;
+            if (claim.status != kClaimPending && claim.status != kClaimApproved) continue;
+            claim.status = kClaimExpired;
+            claim.reviewedAt = now;
+            const std::string claimEvent = EventClaimUpdatedJson(claim, item);
+            claimEvents.push_back(std::make_pair(claimEvent, claim.claimantId));
+            claimEvents.push_back(std::make_pair(claimEvent, item.userId));
+            pendingNotifications.push_back(PushNotification(
+                notifications_, seqNotification_, claim.claimantId, "claim", "认领申请已关闭",
+                "「" + item.title + "」已过期，你的认领申请已自动关闭。", "#/item/" + item.publicId));
+        }
     }
 
     // 2) pending 认领超过 24h 未审核 -> 4，物品若为 1 则回到 0
@@ -1822,22 +1897,16 @@ void Store::SeedLocked() {
     admin.studentNo = "admin";
     admin.name = "系统管理员";
     admin.college = "信息中心";
-    admin.passwordHash = Auth::Instance().HashPassword("admin123");
+    // 首次初始化生成随机管理员密码，明文只在内存中保留到控制台打印一次，不落库、不写入源码。
+    const std::string bootstrapPassword = RandomHex(8);
+    admin.passwordHash = Auth::Instance().HashPassword(bootstrapPassword);
     admin.role = "admin";
     admin.status = 1;
     admin.createdAt = now;
     admin.lastLoginAt = 0;
     users_.push_back(admin);
-
-    Invite invite;
-    invite.code = "CAMPUS-2026";
-    invite.maxUses = 500;
-    invite.uses = 0;
-    invite.expiresAt = now + 365 * kDaySeconds;
-    invite.disabled = false;
-    invite.createdBy = "admin";
-    invite.createdAt = now;
-    invites_.push_back(invite);
+    initialAdminPassword_ = bootstrapPassword;
+    // 邀请码不再预置：管理员登录后台后按需创建，完整码仅在创建时显示一次。
 }
 
 void Store::EmitLocked(const std::string& eventJson, int64_t targetUserId) {

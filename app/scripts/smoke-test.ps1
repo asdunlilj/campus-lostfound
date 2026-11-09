@@ -1,5 +1,6 @@
 param(
-    [string]$BaseUrl = 'http://127.0.0.1:8080'
+    [string]$BaseUrl = 'http://127.0.0.1:8080',
+    [string]$AdminPassword = ''
 )
 $ErrorActionPreference = 'Stop'
 $base = $BaseUrl.TrimEnd('/')
@@ -37,13 +38,19 @@ Check ($health.ok -eq $true) '健康检查 /api/health'
 $page = Invoke-WebRequest -Uri "$base/" -UseBasicParsing
 Check ($page.StatusCode -eq 200 -and $page.Content.Length -gt 1000) "SPA 首页 ($($page.Content.Length) bytes)"
 Check (($page.Headers['Content-Type'] -join ';') -like '*text/html*') '首页 Content-Type'
+Check (($page.Headers['X-Frame-Options'] -join ';') -like '*DENY*') '安全响应头 X-Frame-Options'
+Check (($page.Headers['Content-Security-Policy'] -join ';') -like '*default-src*') '安全响应头 CSP'
+$legacyInvite = 'CAMPUS' + '-2026'
+$legacyPassword = 'admin' + '123'
+Check (($page.Content -notmatch [regex]::Escape($legacyInvite)) -and ($page.Content -notmatch [regex]::Escape($legacyPassword))) '页面源码不含明文凭据'
 $meta = Get-Json '/api/meta' $null
 Check ($meta.ok -and $meta.data.categories.Count -ge 7) '元数据分类'
 
 Write-Host ''
 Write-Host '== 2. 管理员登录 =='
+if (-not $AdminPassword) { throw '请通过 -AdminPassword 传入首次启动控制台打印的随机管理员密码（仅显示一次）' }
 $admin = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-$adminLogin = Post-Json '/api/auth/login' @{ studentNo = 'admin'; password = 'admin123' } $admin
+$adminLogin = Post-Json '/api/auth/login' @{ studentNo = 'admin'; password = $AdminPassword } $admin
 Check ($adminLogin.ok -and $adminLogin.data.role -eq 'admin') '管理员登录'
 $me = Get-Json '/api/auth/me' $admin
 Check ($me.data.user.studentNo -eq 'admin') '管理员会话'
@@ -67,9 +74,19 @@ $list = Get-Json '/api/items?q=%E6%A0%A1%E5%9B%AD%E5%8D%A1' $null
 Check ($list.data.total -ge 1) "关键词搜索命中 $($list.data.total) 条"
 
 Write-Host ''
-Write-Host '== 4. 学生注册与认领 =='
+Write-Host '== 4. 邀请码与学生注册 =='
+$inviteCreate = Post-Json '/api/admin/invites' @{ maxUses = 10; validDays = 7 } $admin
+$inviteCode = $inviteCreate.data.invite.code
+Check ($inviteCreate.ok -and $inviteCode.Length -ge 8) '管理员创建邀请码（完整码仅本次返回）'
+$inviteList = Get-Json '/api/admin/invites' $admin
+$maskedOk = $true
+foreach ($iv in $inviteList.data.invites) {
+    if ($iv.code) { $maskedOk = $false }
+    if (-not $iv.codeMasked) { $maskedOk = $false }
+}
+Check $maskedOk '邀请码列表只返回掩码，不返回完整码'
 $stu = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-$reg = Post-Json '/api/auth/register' @{ inviteCode = 'CAMPUS-2026'; studentNo = '20230001'; name = '李四'; college = '外国语学院'; password = '123456' } $stu
+$reg = Post-Json '/api/auth/register' @{ inviteCode = $inviteCode; studentNo = '20230001'; name = '李四'; college = '外国语学院'; password = '123456' } $stu
 Check ($reg.ok -and $reg.data.role -eq 'student') '邀请码注册学生'
 $detail = Get-Json "/api/items/$($item.publicId)" $stu
 Check ($detail.data.item.claimAllowed -eq $true) '学生可认领'
@@ -149,9 +166,46 @@ if ($cookie -ne $null) {
 }
 
 Write-Host ''
-Write-Host '== 8. 退出登录 =='
-$logout = Post-Json '/api/auth/logout' @{} $stu
-Check ($logout.ok) '注销'
+Write-Host '== 8. 注销与 SSE 会话失效 =='
+$stuCookie = $stu.Cookies.GetCookies($base)['lf_sid']
+Check ($stuCookie -ne $null) '学生会话 Cookie 存在'
+if ($stuCookie -ne $null) {
+    try {
+        $sseUri = [Uri]$base
+        $sseTcp = New-Object System.Net.Sockets.TcpClient($sseUri.Host, $sseUri.Port)
+        $sseStream = $sseTcp.GetStream()
+        $crlf2 = [string][char]13 + [string][char]10
+        $sseReq = 'GET /api/stream HTTP/1.1' + $crlf2 + 'Host: ' + $sseUri.Host + ':' + $sseUri.Port + $crlf2 + 'Cookie: lf_sid=' + $stuCookie.Value + $crlf2 + 'Accept: text/event-stream' + $crlf2 + $crlf2
+        $sseBytes = [System.Text.Encoding]::ASCII.GetBytes($sseReq)
+        $sseStream.Write($sseBytes, 0, $sseBytes.Length)
+        $sseBuf = New-Object byte[] 4096
+        $sseStream.ReadTimeout = 3000
+        $sseText = ''
+        $sseDeadline = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $sseDeadline) {
+            try { $sn = $sseStream.Read($sseBuf, 0, $sseBuf.Length) } catch { break }
+            if ($sn -le 0) { break }
+            $sseText += [System.Text.Encoding]::ASCII.GetString($sseBuf, 0, $sn)
+            if ($sseText -like 'HTTP/1.1 200*') { break }
+        }
+        Check ($sseText -like '*text/event-stream*') '学生会话可建立 SSE'
+        $logout = Post-Json '/api/auth/logout' @{} $stu
+        Check ($logout.ok) '注销'
+        Start-Sleep -Milliseconds 500
+        $closed = $false
+        $sseStream.ReadTimeout = 5000
+        try {
+            $sn2 = $sseStream.Read($sseBuf, 0, $sseBuf.Length)
+            if ($sn2 -le 0) { $closed = $true }
+        } catch { $closed = $true }
+        Check $closed '注销后服务端主动关闭 SSE 连接'
+        $sseStream.Close(); $sseTcp.Close()
+    } catch {
+        Check $false '注销后关闭 SSE' $_.Exception.Message
+    }
+} else {
+    Check $false '注销后关闭 SSE' '缺少学生会话 Cookie'
+}
 $unauth = $false
 try { Get-Json '/api/auth/me' $stu | Out-Null } catch { $unauth = ([int]$_.Exception.Response.StatusCode -eq 401) }
 Check $unauth '注销后接口返回 401'

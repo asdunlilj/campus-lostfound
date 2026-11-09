@@ -5,9 +5,13 @@
 #include "Store.h"
 #include "Util.h"
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <thread>
 
 namespace lf {
 
@@ -66,8 +70,24 @@ void TestStoreFlow(const std::string& dataDir) {
 
     auto admin = store.FindUserByStudentNo("admin");
     Check(admin.has_value() && admin->role == "admin", "种子管理员存在");
-    auto invite = store.FindInvite("CAMPUS-2026");
-    Check(invite.has_value() && invite->maxUses > 0, "种子邀请码存在");
+    const std::string bootstrapPassword = store.TakeInitialAdminPassword();
+    Check(bootstrapPassword.size() >= 12, "首次启动生成随机管理员密码");
+    Check(admin.has_value() && Auth::Instance().VerifyPassword(bootstrapPassword, admin->passwordHash),
+          "随机初始密码可校验管理员");
+    Check(store.TakeInitialAdminPassword().empty(), "初始密码只能取出一次");
+    Check(store.AllInvites().empty(), "不再预置明文邀请码");
+
+    std::string fullInviteCode;
+    Invite createdInvite = store.CreateInvite(2, 7, "admin", fullInviteCode);
+    Check(!fullInviteCode.empty() && fullInviteCode.rfind("LF-", 0) == 0, "创建邀请码返回完整码");
+    Check(createdInvite.codeHash.size() == 64 && createdInvite.codeMasked.find("****") != std::string::npos,
+          "邀请码只保存哈希与掩码");
+    Check(store.FindInvite(fullInviteCode).has_value(), "按明文邀请码可查询");
+    Check(!store.FindInvite("LF-DOES-NOT-EXIST").has_value(), "错误邀请码查询失败");
+    std::string inviteError;
+    Check(store.ConsumeInvite(fullInviteCode, inviteError), "核销邀请码", inviteError);
+    Check(store.ConsumeInvite(fullInviteCode, inviteError), "邀请码可继续使用", inviteError);
+    Check(!store.ConsumeInvite(fullInviteCode, inviteError), "邀请码用尽后被拒绝");
 
     std::string userError;
     int64_t user1 = store.CreateUser("20230001", "张三", "计算机学院",
@@ -130,6 +150,77 @@ void TestStoreFlow(const std::string& dataDir) {
     auto itemCompleted = store.FindItemById(item.id);
     Check(itemCompleted.has_value() && itemCompleted->status == 3, "物品完成");
 
+    // ---- 状态机边界：过期物品 / 下架悬空认领 / 自删通知 / 过期关闭认领 ----
+    std::string edgeError;
+    Item expiredClaimItem;
+    expiredClaimItem.type = 1;
+    expiredClaimItem.userId = user1;
+    expiredClaimItem.title = "过期物品不可认领";
+    expiredClaimItem.description = "过期校验。";
+    expiredClaimItem.categoryId = 7;
+    expiredClaimItem.locationId = 7;
+    expiredClaimItem.expiresAt = NowEpoch() - 10;
+    Check(store.CreateItem(expiredClaimItem, edgeError), "创建过期物品（边界用例）", edgeError);
+    Claim expiredClaim;
+    expiredClaim.itemId = expiredClaimItem.id;
+    expiredClaim.claimantId = user2;
+    Check(!store.CreateClaim(expiredClaim, edgeError), "过期物品不可认领");
+
+    Item takenDown;
+    takenDown.type = 1;
+    takenDown.userId = user1;
+    takenDown.title = "下架物品的认领自动关闭";
+    takenDown.description = "下架边界校验。";
+    takenDown.categoryId = 7;
+    takenDown.locationId = 7;
+    takenDown.expiresAt = NowEpoch() + 30 * 86400;
+    Check(store.CreateItem(takenDown, edgeError), "创建待下架物品", edgeError);
+    Claim pendingClaim;
+    pendingClaim.itemId = takenDown.id;
+    pendingClaim.claimantId = user2;
+    Check(store.CreateClaim(pendingClaim, edgeError), "下架前提交认领", edgeError);
+    Check(store.SetItemStatus(takenDown.id, 5, "测试下架", admin->id, edgeError), "管理员下架物品");
+    auto pendingAfterDown = store.FindClaimById(pendingClaim.id);
+    Check(pendingAfterDown.has_value() && pendingAfterDown->status == 4, "下架后认领申请自动关闭");
+    Claim notApprovable;
+    Check(!store.ApproveClaim(pendingClaim.id, user1, notApprovable, edgeError), "已下架物品不可再通过认领");
+    Check(!store.VerifyClaim(pendingClaim.id, user1, "123456", notApprovable, edgeError), "已关闭认领不可核销");
+
+    Item selfDeleted;
+    selfDeleted.type = 0;
+    selfDeleted.userId = user1;
+    selfDeleted.title = "自删通知校验";
+    selfDeleted.description = "自删不应产生下架通知。";
+    selfDeleted.categoryId = 7;
+    selfDeleted.locationId = 7;
+    selfDeleted.expiresAt = NowEpoch() + 30 * 86400;
+    Check(store.CreateItem(selfDeleted, edgeError), "创建自删物品", edgeError);
+    const int unreadBeforeSelfDelete = store.UnreadCount(user1);
+    Check(store.SetItemStatus(selfDeleted.id, 5, "发布者删除", user1, edgeError), "发布者删除自己的物品");
+    Check(store.UnreadCount(user1) == unreadBeforeSelfDelete, "自删不产生被下架通知");
+
+    Item soonExpire;
+    soonExpire.type = 1;
+    soonExpire.userId = user1;
+    soonExpire.title = "即将过期的认领";
+    soonExpire.description = "过期关闭认领校验。";
+    soonExpire.categoryId = 7;
+    soonExpire.locationId = 7;
+    soonExpire.expiresAt = NowEpoch() + 1;
+    Check(store.CreateItem(soonExpire, edgeError), "创建即将过期物品", edgeError);
+    Claim soonClaim;
+    soonClaim.itemId = soonExpire.id;
+    soonClaim.claimantId = user2;
+    Check(store.CreateClaim(soonClaim, edgeError), "过期前提交认领", edgeError);
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    Claim soonApprove;
+    Check(!store.ApproveClaim(soonClaim.id, user1, soonApprove, edgeError), "物品过期后不可再通过认领");
+    store.ExpireOverdue();
+    auto soonAfter = store.FindClaimById(soonClaim.id);
+    Check(soonAfter.has_value() && soonAfter->status == 4, "物品过期后认领自动关闭");
+    auto soonItemAfter = store.FindItemById(soonExpire.id);
+    Check(soonItemAfter.has_value() && soonItemAfter->status == 4, "物品自动过期");
+
     Item expired;
     expired.type = 0;
     expired.userId = user1;
@@ -160,6 +251,13 @@ void TestStoreFlow(const std::string& dataDir) {
     std::string saveError;
     Check(store.Save(&saveError), "保存 db.json", saveError);
     Check(std::filesystem::exists(dataDir + "/db.json"), "db.json 文件存在");
+
+    std::ifstream dbFile(dataDir + "/db.json", std::ios::binary);
+    const std::string dbContent((std::istreambuf_iterator<char>(dbFile)), std::istreambuf_iterator<char>());
+    Check(!dbContent.empty(), "读取 db.json 内容");
+    Check(dbContent.find(fullInviteCode) == std::string::npos, "db.json 不含邀请码明文");
+    Check(dbContent.find(bootstrapPassword) == std::string::npos, "db.json 不含管理员初始密码明文");
+    Check(dbContent.find(createdInvite.codeHash) != std::string::npos, "db.json 保存邀请码哈希");
 }
 
 } // namespace

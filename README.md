@@ -52,7 +52,7 @@
 | 持久化 | JSON 全量快照 + 原子写（`db.json.tmp` → rename），图片落 `data/uploads` |
 | 密码 | PBKDF2-HMAC-SHA256，60000 次迭代 + 16 字节随机盐，常量时间比较 |
 | 前端 | 原生 HTML/CSS/JS，哈希路由，无 CDN、无外部资源 |
-| 测试 | 进程内自测 41 项 + HTTP 冒烟测试 32 项 |
+| 测试 | 进程内自测 71 项 + HTTP 冒烟测试 40 项（含明文凭据泄露、SSE 注销失效、状态机边界检查） |
 
 ---
 
@@ -63,12 +63,13 @@
 1. 双击打开 `app/CampusLostFound.sln`
 2. 选择 `Debug` + `x64`，按 `Ctrl+F5`
 3. 浏览器访问 <http://127.0.0.1:8080>
-4. 控制台会打印局域网访问地址、管理员账号与邀请码
+4. 控制台会打印局域网访问地址；**首次启动还会打印一次随机管理员密码**（仅显示一次）
+5. 用 admin + 该密码登录 → 修改密码 → 在「管理后台 → 邀请码」创建邀请码（完整码仅显示一次）→ 发给同学注册
 
 | 项 | 值 |
 |---|---|
-| 管理员 | `admin` / `admin123`（**首次部署后必须修改**） |
-| 演示邀请码 | `CAMPUS-2026` |
+| 管理员 | `admin` / **首次启动控制台随机密码（仅显示一次，登录后立即修改）** |
+| 邀请码 | **不预置**；管理员后台创建，数据库只存哈希，列表只显示掩码，完整码仅创建时显示一次 |
 
 命令行启动参数：
 
@@ -101,11 +102,11 @@ campus-lostfound/
 ## 测试
 
 ```powershell
-# 进程内自测（41 项，不启网络）
-.\app\x64\Debug\CampusLostFound.exe --selftest
+# 进程内自测（71 项，不启网络）
+.\app\bin\Debug\CampusLostFound.exe --selftest
 
-# HTTP 冒烟测试（32 项，需服务已启动）
-pwsh -NoProfile -File app\scripts\smoke-test.ps1
+# HTTP 冒烟测试（需服务已启动；密码用首次启动控制台打印的随机密码）
+pwsh -NoProfile -File app\scripts\smoke-test.ps1 -AdminPassword '<首次启动密码>'
 ```
 
 覆盖：JSON 解析、密码哈希、业务闭环、过期扫描、通知、持久化、越权 403、重复认领 409、SSE 握手等。
@@ -115,6 +116,8 @@ pwsh -NoProfile -File app\scripts\smoke-test.ps1
 ## 安全设计
 
 - **密码**：PBKDF2-HMAC-SHA256（60000 迭代 + 随机盐 + 常量时间比较），不落明文
+- **邀请码**：只存 SHA-256 哈希 + 掩码；完整明文仅在创建响应返回一次；注册页/登录页/列表页不展示明文
+- **管理员初始密码**：首次启动随机生成，仅控制台显示一次，不落库/不写源码/不进日志
 - **会话**：`HttpOnly` + `SameSite=Lax` 服务端会话 Cookie，重启失效
 - **CSRF**：所有非 GET 请求校验 `X-Requested-With: CampusLF`
 - **上传**：白名单类型 + Magic Bytes + 大小上限 + 随机文件名 + 路径穿越校验
@@ -130,7 +133,10 @@ pwsh -NoProfile -File app\scripts\smoke-test.ps1
 2. HTTP 明文 —— 局域网可用；PWA / Service Worker / 相机 / Web Push 需要 HTTPS。
 3. 会话存内存 —— 服务重启需重新登录。
 4. HTTP 服务为教学级实现，未做压测调优，内网数十人规模足够。
-5. **默认管理员密码 `admin123` 仅供本地演示，部署到任何可被他人访问的环境前必须修改。**
+5. **首次启动的随机管理员密码只在控制台显示一次，必须立即修改；忘记需重置 data 目录（数据清空）。**
+6. **HTTP 明文传输**：内网演示可用；正式部署必须 HTTPS，否则邀请码/密码/Cookie 可能被同网段嗅探。
+7. **数据文件敏感**：db.json 含密码哈希、邀请码哈希、学号姓名等个人信息，勿入 Git/网盘，建议用 `app/scripts/secure-data-acl.ps1` 收紧权限。
+8. 上传图片可能含 EXIF/GPS；页面已提示勿上传人脸/证件/定位信息，正式环境建议服务端剥离 EXIF。
 
 > 面向师生正式提供服务前，建议向学校网络中心与指导老师报备，并按《个人信息保护法》做最小必要采集与脱敏展示。
 

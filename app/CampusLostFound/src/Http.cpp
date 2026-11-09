@@ -417,7 +417,16 @@ struct HttpServer::Impl {
         out += "Connection: close\r\n";
         out += "X-Content-Type-Options: nosniff\r\n";
         out += "Referrer-Policy: no-referrer\r\n";
-        out += "Cache-Control: no-store\r\n";
+        out += "X-Frame-Options: DENY\r\n";
+        out += "Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'\r\n";
+        bool hasCacheControl = false;
+        for (const auto& header : response.headers) {
+            if (ToLowerStr(header.first) == "cache-control") {
+                hasCacheControl = true;
+                break;
+            }
+        }
+        if (!hasCacheControl) out += "Cache-Control: no-store\r\n";
         for (const auto& header : response.headers) {
             out += header.first + ": " + header.second + "\r\n";
         }

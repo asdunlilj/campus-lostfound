@@ -30,4 +30,4 @@ Write-Host "MSBuild: $msbuild"
 & $msbuild $sln /p:Configuration=$Configuration /p:Platform=$Platform /m /v:m /nologo
 if ($LASTEXITCODE -ne 0) { throw "编译失败，退出码 $LASTEXITCODE" }
 Write-Host ""
-Write-Host "编译成功: $root\$Platform\$Configuration\CampusLostFound.exe"
+Write-Host "编译成功: $root\bin\$Configuration\CampusLostFound.exe"
